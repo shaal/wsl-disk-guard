@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+# disk-guard: warn before a disk fills up, clean caches that are safe to lose,
+# and alert when a watched service is stuck in a crash loop.
+#
+# Plain bash. No network calls. Built for WSL2, works on any systemd Linux.
+set -euo pipefail
+
+VERSION="0.1.0"
+export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+CONFIG_FILE="${DISK_GUARD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/disk-guard/config}"
+STATE_DIR="${DISK_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/disk-guard}"
+LOG_FILE="$STATE_DIR/disk-guard.log"
+LOG_MAX_BYTES=1048576
+
+# ---------------------------------------------------------------------------
+# Defaults. Override any of these in the config file.
+# ---------------------------------------------------------------------------
+WATCH_MOUNTS="/:50"             # "path:warn_gb ..." - warn when free space drops below warn_gb
+CRITICAL_GB=25                  # emergency clean starts below this (Docker data disk only)
+TARGET_GB=80                    # emergency clean stops once this much is free
+CLEAN_VOLUME_PATTERNS=""        # shell globs of Docker volumes that are safe to delete when unused
+BUILD_CACHE_MAX_AGE_HOURS=168   # daily: prune Docker build cache older than this (0 = off)
+PRUNE_DANGLING_IMAGES=1         # daily: remove untagged Docker images (0 = off)
+TMP_MAX_AGE_DAYS=7              # daily: delete your own /tmp files unused this long (0 = off)
+WATCH_SERVICES=""               # systemd --user units to watch for crash loops
+CRASH_LOOP_RESTARTS=3           # alert when a unit restarts this often between two checks
+REPORT_PATHS="$HOME"            # paths that `disk-guard report` measures
+NOTIFY="auto"                   # auto | windows | notify-send | none
+NOTIFY_REPEAT_MINUTES=60        # repeat the same warning at most this often
+DRY_RUN=0                       # 1 = log what would be deleted, delete nothing
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+mkdir -p "$STATE_DIR"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+log() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+  [[ -t 1 ]] && printf '%s\n' "$line"
+  return 0
+}
+
+trim_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  if ((size > LOG_MAX_BYTES)); then
+    tail -n 2000 "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+  return 0
+}
+
+is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+powershell_bin() {
+  if command -v powershell.exe >/dev/null 2>&1; then
+    command -v powershell.exe
+  elif [[ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]]; then
+    echo /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+  else
+    return 1
+  fi
+}
+
+ps_quote() { printf "'%s'" "${1//\'/\'\'}"; }
+
+notify_windows() {
+  local title="$1" body="$2" ps script
+  ps=$(powershell_bin) || return 1
+  script="\$ErrorActionPreference='Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+\$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+\$t = \$x.GetElementsByTagName('text')
+\$t.Item(0).AppendChild(\$x.CreateTextNode($(ps_quote "$title"))) | Out-Null
+\$t.Item(1).AppendChild(\$x.CreateTextNode($(ps_quote "$body"))) | Out-Null
+\$id = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\$id).Show([Windows.UI.Notifications.ToastNotification]::new(\$x))"
+  timeout 30 "$ps" -NoProfile -NonInteractive -EncodedCommand \
+    "$(printf '%s' "$script" | iconv -f utf-8 -t utf-16le | base64 -w0)" >/dev/null 2>&1
+}
+
+notify_linux() {
+  command -v notify-send >/dev/null 2>&1 || return 1
+  notify-send --app-name=disk-guard "$1" "$2" >/dev/null 2>&1
+}
+
+notify() {
+  local title="$1" body="$2" mode="$NOTIFY"
+  log "NOTIFY $title: $body"
+  if [[ "$mode" == auto ]]; then
+    if is_wsl; then mode=windows; else mode=notify-send; fi
+  fi
+  case "$mode" in
+    windows) notify_windows "$title" "$body" || notify_linux "$title" "$body" || log "WARN could not show a notification" ;;
+    notify-send) notify_linux "$title" "$body" || log "WARN could not show a notification" ;;
+    none) ;;
+    *) log "WARN unknown NOTIFY mode: $mode" ;;
+  esac
+  return 0
+}
+
+# Notify at most once per NOTIFY_REPEAT_MINUTES for a given key.
+notify_throttled() {
+  local key="$1" title="$2" body="$3" stamp now last
+  stamp="$STATE_DIR/notified-${key//[^A-Za-z0-9_.-]/_}"
+  now=$(date +%s)
+  last=$(cat "$stamp" 2>/dev/null || echo 0)
+  if ((now - last >= NOTIFY_REPEAT_MINUTES * 60)); then
+    notify "$title" "$body"
+    echo "$now" >"$stamp"
+  else
+    log "SKIP repeat notification for $key"
+  fi
+}
+
+clear_throttle() { rm -f "$STATE_DIR/notified-${1//[^A-Za-z0-9_.-]/_}"; }
+
+free_mb() { df -B1M --output=avail "$1" 2>/dev/null | tail -n 1 | tr -d ' '; }
+
+mb_to_gb() { awk -v m="$1" 'BEGIN { printf "%.1f", m / 1024 }'; }
+
+have_docker() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+docker_mount() {
+  local root
+  root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) || return 1
+  df --output=target "$root" 2>/dev/null | tail -n 1
+}
+
+# Converts Docker sizes such as "23.01GB", "84.71MB", "0B" to bytes.
+size_to_bytes() {
+  awk -v s="$1" 'BEGIN {
+    n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
+    m["B"]=1; m["kB"]=1e3; m["KB"]=1e3; m["MB"]=1e6; m["GB"]=1e9; m["TB"]=1e12
+    printf "%.0f", n * ((u in m) ? m[u] : 1)
+  }'
+}
+
+matches_patterns() {
+  local name="$1" pattern
+  for pattern in $CLEAN_VOLUME_PATTERNS; do
+    # shellcheck disable=SC2053
+    [[ "$name" == $pattern ]] && return 0
+  done
+  return 1
+}
+
+# Prints "bytes name" for each unused volume that matches CLEAN_VOLUME_PATTERNS, biggest first.
+clean_candidates() {
+  local dangling name size links
+  dangling=" $(docker volume ls -q -f dangling=true | tr '\n' ' ') "
+  docker system df -v --format '{{range .Volumes}}{{.Name}}|{{.Size}}|{{.Links}}{{println}}{{end}}' 2>/dev/null |
+    while IFS='|' read -r name size links; do
+      [[ -n "$name" && "$links" == 0 ]] || continue
+      [[ "$dangling" == *" $name "* ]] || continue
+      matches_patterns "$name" || continue
+      printf '%s %s\n' "$(size_to_bytes "$size")" "$name"
+    done | sort -rn
+}
+
+# ---------------------------------------------------------------------------
+# check: runs every 10 minutes
+# ---------------------------------------------------------------------------
+check_mounts() {
+  local entry mount warn_gb free key
+  for entry in $WATCH_MOUNTS; do
+    mount="${entry%%:*}"
+    warn_gb="${entry#*:}"
+    [[ "$warn_gb" == "$entry" ]] && warn_gb=50
+    key="low-$mount"
+    if ! free=$(free_mb "$mount") || [[ -z "$free" ]]; then
+      log "WARN cannot read free space for $mount"
+      continue
+    fi
+    if ((free < warn_gb * 1024)); then
+      notify_throttled "$key" "Low disk space: $mount" \
+        "$(mb_to_gb "$free") GB free (warning level: $warn_gb GB). Run 'disk-guard report' to see what uses the space."
+    else
+      clear_throttle "$key"
+      log "OK $mount has $(mb_to_gb "$free") GB free"
+    fi
+  done
+}
+
+emergency_clean() {
+  local mount free critical_mb target_mb before bytes name deleted=() freed_gb
+  have_docker || return 0
+  mount=$(docker_mount) || return 0
+  free=$(free_mb "$mount") || return 0
+  [[ -n "$free" ]] || return 0
+  critical_mb=$((CRITICAL_GB * 1024))
+  target_mb=$((TARGET_GB * 1024))
+  ((free < critical_mb)) || return 0
+
+  log "CRITICAL $mount has $(mb_to_gb "$free") GB free (critical level: $CRITICAL_GB GB)"
+  if [[ -z "$CLEAN_VOLUME_PATTERNS" ]]; then
+    notify_throttled critical "Disk almost full: $mount" \
+      "Only $(mb_to_gb "$free") GB free. Automatic clean is off (CLEAN_VOLUME_PATTERNS is empty). Free space now."
+    return 0
+  fi
+
+  before=$free
+  while read -r bytes name; do
+    [[ -n "$name" ]] || continue
+    ((free >= target_mb)) && break
+    if [[ "$DRY_RUN" == 1 ]]; then
+      log "DRY-RUN would delete volume $name ($(awk -v b="$bytes" 'BEGIN{printf "%.1f", b/1e9}') GB)"
+      deleted+=("$name")
+      free=$((free + bytes / 1048576))
+      continue
+    fi
+    # Docker refuses to delete a volume that a container uses, so a build that
+    # started a moment ago keeps its volume.
+    if docker volume rm "$name" >/dev/null 2>&1; then
+      log "DELETED volume $name ($(awk -v b="$bytes" 'BEGIN{printf "%.1f", b/1e9}') GB)"
+      deleted+=("$name")
+    else
+      log "SKIP volume $name (in use or already gone)"
+    fi
+    free=$(free_mb "$mount" || echo "$free")
+  done < <(clean_candidates)
+
+  if ((${#deleted[@]} > 0)); then
+    freed_gb=$(mb_to_gb $((free - before)))
+    if [[ "$DRY_RUN" == 1 ]]; then
+      notify "disk-guard dry run" "Would free about $freed_gb GB by deleting ${#deleted[@]} Docker volume(s): ${deleted[*]}"
+    else
+      notify "disk-guard freed $freed_gb GB" \
+        "Deleted ${#deleted[@]} unused Docker volume(s): ${deleted[*]}. Free now: $(mb_to_gb "$free") GB on $mount."
+    fi
+  fi
+  if ((free < critical_mb)); then
+    notify_throttled critical "Disk almost full: $mount" \
+      "Only $(mb_to_gb "$free") GB free and nothing safe is left to delete. Free space now. Run 'disk-guard report'."
+  else
+    clear_throttle critical
+  fi
+}
+
+check_services() {
+  local unit state restarts prev delta file
+  for unit in $WATCH_SERVICES; do
+    if ! systemctl --user cat "$unit" >/dev/null 2>&1; then
+      log "WARN watched unit $unit does not exist"
+      continue
+    fi
+    state=$(systemctl --user show "$unit" -p ActiveState --value 2>/dev/null)
+    restarts=$(systemctl --user show "$unit" -p NRestarts --value 2>/dev/null)
+    restarts=${restarts:-0}
+    file="$STATE_DIR/restarts-${unit//[^A-Za-z0-9_.-]/_}"
+    prev=$(cat "$file" 2>/dev/null || echo "$restarts")
+    echo "$restarts" >"$file"
+    delta=$((restarts >= prev ? restarts - prev : restarts))
+
+    if [[ "$state" == failed || "$state" == inactive ]]; then
+      notify_throttled "down-$unit" "$unit is down" \
+        "State: $state. Run: systemctl --user status $unit"
+    elif ((delta >= CRASH_LOOP_RESTARTS)); then
+      notify_throttled "loop-$unit" "$unit is crash-looping" \
+        "It restarted $delta times since the last check. Run: journalctl --user -u $unit -n 50"
+    else
+      clear_throttle "down-$unit"
+      clear_throttle "loop-$unit"
+      log "OK $unit is $state (restarts since last check: $delta)"
+    fi
+  done
+}
+
+cmd_check() {
+  check_mounts
+  emergency_clean
+  check_services
+}
+
+# ---------------------------------------------------------------------------
+# daily: runs once a day
+# ---------------------------------------------------------------------------
+cmd_daily() {
+  local out count
+  if have_docker; then
+    if ((BUILD_CACHE_MAX_AGE_HOURS > 0)); then
+      if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY-RUN would run: docker builder prune -f --filter until=${BUILD_CACHE_MAX_AGE_HOURS}h"
+      else
+        out=$(docker builder prune -f --filter "until=${BUILD_CACHE_MAX_AGE_HOURS}h" 2>&1 | tail -n 1 || true)
+        log "DAILY build cache: $out"
+      fi
+    fi
+    if [[ "$PRUNE_DANGLING_IMAGES" == 1 ]]; then
+      if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY-RUN would remove $(docker images -q -f dangling=true | wc -l) untagged image(s)"
+      else
+        out=$(docker image prune -f 2>&1 | tail -n 1 || true)
+        log "DAILY untagged images: $out"
+      fi
+    fi
+  fi
+
+  if ((TMP_MAX_AGE_DAYS > 0)); then
+    local find_args=(/tmp -xdev -mindepth 1 -user "$(id -u)" -type f -mtime "+$TMP_MAX_AGE_DAYS" -atime "+$TMP_MAX_AGE_DAYS")
+    if [[ "$DRY_RUN" == 1 ]]; then
+      count=$(find "${find_args[@]}" 2>/dev/null | wc -l || true)
+      log "DRY-RUN would delete $count file(s) in /tmp older than $TMP_MAX_AGE_DAYS days"
+    else
+      count=$(find "${find_args[@]}" -print -delete 2>/dev/null | wc -l || true)
+      find /tmp -xdev -mindepth 1 -user "$(id -u)" -type d -empty -mtime "+$TMP_MAX_AGE_DAYS" -delete 2>/dev/null || true
+      log "DAILY deleted $count file(s) in /tmp older than $TMP_MAX_AGE_DAYS days"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# report: run by hand
+# ---------------------------------------------------------------------------
+cmd_report() {
+  local entry mount p
+  echo "== Free space"
+  for entry in $WATCH_MOUNTS; do
+    mount="${entry%%:*}"
+    df -h --output=target,size,used,avail,pcent "$mount" 2>/dev/null | tail -n 1
+  done
+  if have_docker; then
+    echo
+    echo "== Docker"
+    docker system df 2>/dev/null
+    if [[ -n "$CLEAN_VOLUME_PATTERNS" ]]; then
+      echo
+      echo "== Volumes the emergency clean may delete ($CLEAN_VOLUME_PATTERNS)"
+      clean_candidates | awk '{ printf "%8.1f GB  %s\n", $1 / 1e9, $2 }'
+    fi
+  fi
+  echo
+  echo "== Sizes of REPORT_PATHS (this can take a minute)"
+  for p in $REPORT_PATHS; do
+    [[ -e "$p" ]] && timeout 120 du -xsh "$p" 2>/dev/null
+  done | sort -rh
+  echo
+  echo "== Last 10 log lines ($LOG_FILE)"
+  tail -n 10 "$LOG_FILE" 2>/dev/null || echo "(no log yet)"
+}
+
+usage() {
+  cat <<EOF
+disk-guard $VERSION - warn before the disk fills up and clean safe caches
+
+Usage: disk-guard [--dry-run] <command>
+
+Commands:
+  check         Check free space, run the emergency clean, check services (timer: every 10 min)
+  daily         Prune old Docker build cache, untagged images and old /tmp files (timer: daily)
+  report        Show free space, Docker usage, clean candidates and folder sizes
+  notify-test   Show a test notification
+  version       Print the version
+
+Config: $CONFIG_FILE
+Log:    $LOG_FILE
+EOF
+}
+
+main() {
+  if [[ "${1:-}" == --dry-run ]]; then
+    DRY_RUN=1
+    shift
+  fi
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    check | daily)
+      exec 9>"$STATE_DIR/lock"
+      if ! flock -n 9; then
+        log "SKIP $cmd: another disk-guard run is active"
+        exit 0
+      fi
+      trim_log
+      "cmd_$cmd"
+      ;;
+    report) cmd_report ;;
+    notify-test) notify "disk-guard test" "Notifications work. You will see warnings like this one." ;;
+    version) echo "disk-guard $VERSION" ;;
+    help | -h | --help) usage ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

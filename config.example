@@ -1,0 +1,41 @@
+# disk-guard config. This file is sourced by bash.
+# Location: ~/.config/disk-guard/config
+
+# Mounts to watch, as "path:warn_gb". You get a notification when free space
+# drops below warn_gb. On WSL, also watch the Windows drive that holds ext4.vhdx.
+WATCH_MOUNTS="/:50"
+# WATCH_MOUNTS="/:50 /mnt/c:20"
+
+# Emergency clean. Runs only on the disk that holds Docker data.
+# It starts when free space drops below CRITICAL_GB and stops at TARGET_GB.
+CRITICAL_GB=25
+TARGET_GB=80
+
+# Docker volumes that the emergency clean may delete, as shell globs.
+# Only volumes that no container uses are deleted, biggest first.
+# Put only caches here (build output, package caches), never databases.
+# Empty = the emergency clean never deletes anything, it only warns.
+CLEAN_VOLUME_PATTERNS=""
+# CLEAN_VOLUME_PATTERNS="myproject-target-* myproject-cargo-cache-*"
+
+# Daily clean. Set a value to 0 to turn that step off.
+BUILD_CACHE_MAX_AGE_HOURS=168   # Docker build cache older than 7 days
+PRUNE_DANGLING_IMAGES=1         # untagged Docker images
+TMP_MAX_AGE_DAYS=7              # your own files in /tmp, not used for 7 days
+
+# systemd --user units to watch. You get a notification when a unit is down,
+# or when it restarts CRASH_LOOP_RESTARTS times or more between two checks.
+WATCH_SERVICES=""
+# WATCH_SERVICES="t3code.service"
+CRASH_LOOP_RESTARTS=3
+
+# Paths that `disk-guard report` measures.
+REPORT_PATHS="$HOME"
+# REPORT_PATHS="$HOME/code $HOME/.cache $HOME/.local"
+
+# auto = Windows toast on WSL, notify-send on Linux. Or: windows | notify-send | none
+NOTIFY="auto"
+NOTIFY_REPEAT_MINUTES=60
+
+# 1 = log what would be deleted, delete nothing.
+DRY_RUN=0

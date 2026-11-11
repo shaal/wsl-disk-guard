@@ -1,0 +1,8 @@
+[Unit]
+Description=disk-guard: daily clean of old caches
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/disk-guard daily
+Nice=10
+IOSchedulingClass=idle

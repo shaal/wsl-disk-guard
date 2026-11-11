@@ -1,0 +1,8 @@
+[Unit]
+Description=disk-guard: check free space and watched services
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/disk-guard check
+Nice=10
+IOSchedulingClass=idle
